@@ -1,0 +1,1 @@
+from subtitles.opensubtitles import OpenSubtitlesProvider

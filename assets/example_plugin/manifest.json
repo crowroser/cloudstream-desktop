@@ -1,0 +1,11 @@
+{
+  "name": "Example Provider",
+  "plugin_class_name": "ExamplePlugin",
+  "version": 1,
+  "internal_name": "example_provider",
+  "description": "A demo plugin showing how to write a CloudStream Desktop extension.",
+  "author": "CloudStream Desktop",
+  "language": "en",
+  "tv_types": ["Movie", "TvSeries"],
+  "icon_url": null
+}
