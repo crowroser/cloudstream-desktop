@@ -33,7 +33,9 @@ from plugins.cs3_parser import (
     CategorizedStrings,
     KNOWN_EXTRACTORS,
     TV_TYPE_MAP,
+    _detect_main_url,
     _fetch_domain_from_list,
+    _normalize_manifest_tv_types,
 )
 
 
@@ -69,6 +71,74 @@ class DecompiledProvider:
     data_classes: Dict[str, List[str]] = field(default_factory=dict)
 
 
+_CONSTRUCTOR_HEADER_KEYS = frozenset({
+    "cf-control", "sec-ch-ua-platform", "user-agent", "accept",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-gpc", "accept-language",
+    "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+    "referer", "accept-encoding", "priority", "user-profile",
+    "user-session", "x-e-h", "x-api-key", "authorization",
+    "cookie", "x-requested-with", "content-type",
+})
+
+_PATH_ASSET_EXT_RE = re.compile(
+    r"\.(js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?)(\?.*)?$",
+    re.I,
+)
+
+
+def _is_main_path_candidate(s: str, header_keys: Set[str]) -> bool:
+    if not s or len(s) < 2 or not s.startswith("/") or s.startswith("//"):
+        return False
+    if s.lower() in header_keys:
+        return False
+    if _PATH_ASSET_EXT_RE.search(s):
+        return False
+    return True
+
+
+def _is_main_label_candidate(s: str, header_keys: Set[str]) -> bool:
+    if not s or s.startswith("/") or s.startswith("http://") or s.startswith("https://"):
+        return False
+    return s.lower() not in header_keys
+
+
+def _consume_main_page_from_index(
+    strings: List[str], i: int, header_keys: Set[str]
+) -> Optional[Tuple[int, Tuple[str, str]]]:
+    """Bir (label, url) cifti tuketir; yoksa None."""
+    n = len(strings)
+    s = strings[i]
+    if i + 1 < n and _is_main_label_candidate(s, header_keys) and _is_main_path_candidate(
+        strings[i + 1], header_keys
+    ):
+        return i + 2, (s, strings[i + 1])
+    if _is_main_path_candidate(s, header_keys):
+        if i + 1 < n and _is_main_label_candidate(strings[i + 1], header_keys):
+            return i + 2, (strings[i + 1], s)
+        return i + 1, (s, s)
+    return None
+
+
+def _extract_adjacent_main_page_pairs(
+    strings: List[str], header_keys: Set[str]
+) -> List[Tuple[str, str]]:
+    """Header ayrimi olmadan komşu path/label ciftlerini cikar (method string'leri icin)."""
+    out: List[Tuple[str, str]] = []
+    seen_local: Set[Tuple[str, str]] = set()
+    i = 0
+    while i < len(strings):
+        consumed = _consume_main_page_from_index(strings, i, header_keys)
+        if consumed:
+            ni, pair = consumed
+            if pair not in seen_local:
+                seen_local.add(pair)
+                out.append(pair)
+            i = ni
+            continue
+        i += 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Ana decompile fonksiyonu
 # ---------------------------------------------------------------------------
@@ -96,8 +166,8 @@ def deep_parse_cs3(data: bytes, fallback_name: str = "Unknown") -> CS3ParseResul
         main_class_base = main_class_base[:-6]
 
     categorized = _build_categorized(provider, all_strings, manifest)
-    main_url = _resolve_main_url(manifest.name, provider, categorized.urls)
-    tv_types = _detect_tv_types(all_strings, provider)
+    main_url = _resolve_main_url(manifest.name, provider, categorized.urls, all_strings)
+    tv_types = _detect_tv_types(all_strings, provider, manifest.tv_types)
     plugin_type = _detect_plugin_type(provider, categorized)
     auth_pattern, auth_details = _detect_auth(provider)
 
@@ -146,11 +216,15 @@ def _parse_manifest(zf: zipfile.ZipFile, fallback_name: str) -> CS3Manifest:
     if "manifest.json" in zf.namelist():
         try:
             mdata = json.loads(zf.read("manifest.json").decode("utf-8"))
+            tv_raw = mdata.get("tvTypes", mdata.get("tv_types", []))
+            if not isinstance(tv_raw, list):
+                tv_raw = []
             manifest = CS3Manifest(
                 plugin_class_name=mdata.get("pluginClassName", ""),
                 name=mdata.get("name", fallback_name),
                 version=mdata.get("version", 0),
                 requires_resources=mdata.get("requiresResources", False),
+                tv_types=[str(x) for x in tv_raw],
             )
         except Exception as e:
             print(f"[CS3Decompiler] manifest.json parse hata: {e}")
@@ -279,51 +353,30 @@ def _analyze_method(method) -> MethodInfo:
 def _extract_pairs_from_constructor(minfo: MethodInfo, provider: DecompiledProvider):
     """Constructor'daki string listesinden header key-value ve mainPage label-url cikarimi."""
     strings = minfo.strings
-
-    header_keys = {
-        "cf-control", "sec-ch-ua-platform", "user-agent", "accept",
-        "sec-ch-ua", "sec-ch-ua-mobile", "sec-gpc", "accept-language",
-        "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
-        "referer", "accept-encoding", "priority", "user-profile",
-        "user-session", "x-e-h", "x-api-key", "authorization",
-        "cookie", "x-requested-with", "content-type",
-    }
+    header_keys = _CONSTRUCTOR_HEADER_KEYS
+    seen_pairs: Set[Tuple[str, str]] = {tuple(p) for p in provider.main_page_pairs}
 
     i = 0
-    in_headers = False
-    in_main_page = False
-
     while i < len(strings):
         s = strings[i]
         s_lower = s.lower()
 
         if s_lower in header_keys:
-            in_headers = True
-            in_main_page = False
             if i + 1 < len(strings):
                 provider.header_pairs.append((s, strings[i + 1]))
                 i += 2
-                continue
-            i += 1
+            else:
+                i += 1
             continue
 
-        if s.startswith("/page/") or s.startswith("/secure/") or s.startswith("/api/"):
-            in_main_page = True
-            in_headers = False
-            url = s
-            if i + 1 < len(strings) and not strings[i + 1].startswith("/") and not strings[i + 1].lower() in header_keys:
-                label = strings[i + 1]
-                provider.main_page_pairs.append((label, url))
-                i += 2
-                continue
-            provider.main_page_pairs.append((s, s))
-            i += 1
+        consumed = _consume_main_page_from_index(strings, i, header_keys)
+        if consumed:
+            ni, pair = consumed
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                provider.main_page_pairs.append(pair)
+            i = ni
             continue
-
-        if in_main_page and i > 0:
-            prev = strings[i - 1] if i - 1 >= 0 else ""
-            if prev.startswith("/"):
-                pass
 
         i += 1
 
@@ -364,6 +417,21 @@ def _build_categorized(
         cat.main_page_entries.append(url)
         cat.main_page_labels.append(label)
 
+    seen_main: Set[Tuple[str, str]] = {
+        (l, u) for l, u in zip(cat.main_page_labels, cat.main_page_entries)
+    }
+    hk = _CONSTRUCTOR_HEADER_KEYS
+    for mname, minfo in provider.methods.items():
+        if mname == "<init>":
+            continue
+        for label, url in _extract_adjacent_main_page_pairs(minfo.strings, hk):
+            if (label, url) in seen_main:
+                continue
+            seen_main.add((label, url))
+            provider.main_page_pairs.append((label, url))
+            cat.main_page_entries.append(url)
+            cat.main_page_labels.append(label)
+
     seen_urls: Set[str] = set()
     seen_endpoints: Set[str] = set()
 
@@ -402,14 +470,19 @@ def _build_categorized(
                     cat.endpoints.append(s)
             continue
 
-    for mname, minfo in provider.methods.items():
-        if "search" in mname.lower():
-            for s in minfo.strings:
-                if s.startswith("/") and "search" in s.lower() and s not in cat.search_endpoints:
-                    cat.search_endpoints.append(s)
-                if "?q=" in s or "?adi=" in s or "?s=" in s:
-                    if s not in cat.search_endpoints:
-                        cat.search_endpoints.append(s)
+    def _maybe_add_search(s: str) -> None:
+        if not s or len(s) > 2000:
+            return
+        low = s.lower()
+        if "search" in low or "?adi=" in low or "?s=" in low or "?q=" in low or "query=" in low or "arama" in low:
+            if s not in cat.search_endpoints:
+                cat.search_endpoints.append(s)
+
+    for minfo in provider.methods.values():
+        for s in minfo.strings:
+            _maybe_add_search(s)
+        for u in minfo.http_urls:
+            _maybe_add_search(u)
 
     return cat
 
@@ -419,7 +492,7 @@ def _build_categorized(
 # ---------------------------------------------------------------------------
 
 def _resolve_main_url(
-    name: str, provider: DecompiledProvider, urls: List[str]
+    name: str, provider: DecompiledProvider, urls: List[str], all_strings: List[str]
 ) -> str:
     from urllib.parse import urlparse
 
@@ -445,8 +518,6 @@ def _resolve_main_url(
             if parsed.netloc and not any(d in parsed.netloc for d in skip_domains):
                 return f"{parsed.scheme}://{parsed.netloc}"
 
-    # Constructor'da bulunamadıysa tüm method URL'lerine bak
-    # Öncelik: getMainPage > search > load > diğer
     priority_methods = ["getMainPage", "search", "load"]
     for target_method in priority_methods:
         for mname, minfo in provider.methods.items():
@@ -456,7 +527,10 @@ def _resolve_main_url(
                     if parsed.netloc and not any(d in parsed.netloc for d in skip_domains):
                         return f"{parsed.scheme}://{parsed.netloc}"
 
-    # Son çare: DEX'teki tüm URL'ler arasından en uygununu seç
+    detected = _detect_main_url(name, urls, all_strings)
+    if detected:
+        return detected
+
     domain_counts: Dict[str, int] = {}
     for url in urls:
         try:
@@ -478,8 +552,12 @@ def _resolve_main_url(
 # TvType tespiti
 # ---------------------------------------------------------------------------
 
-def _detect_tv_types(all_strings: List[str], provider: DecompiledProvider) -> List[str]:
-    types = set()
+def _detect_tv_types(
+    all_strings: List[str],
+    provider: DecompiledProvider,
+    manifest_tv_types: Optional[List[str]] = None,
+) -> List[str]:
+    types = set(_normalize_manifest_tv_types(manifest_tv_types or []))
 
     for s in all_strings:
         if s.startswith("TvType.") or s.startswith("TvType$"):

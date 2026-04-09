@@ -88,22 +88,43 @@ def generate_plugin(parsed: CS3ParseResult) -> str:
 # ---------------------------------------------------------------------------
 
 def _detect_api_style(parsed: CS3ParseResult) -> str:
-    all_eps = parsed.categorized.endpoints + parsed.categorized.main_page_entries
-    ep_str = " ".join(all_eps).lower()
-    if "/anime/" in ep_str or "/page/catalog" in ep_str or "/page/search" in ep_str:
+    all_eps = list(parsed.categorized.endpoints) + list(parsed.categorized.main_page_entries)
+    meth_parts: List[str] = []
+    for m in parsed.api_methods or []:
+        meth_parts.extend(str(x) for x in (m.get("strings") or []))
+        meth_parts.extend(str(x) for x in (m.get("http_urls") or []))
+    combined = (" ".join(all_eps) + " " + " ".join(meth_parts)).lower()
+
+    if "/anime/" in combined or "/page/catalog" in combined or "/page/search" in combined:
         return "anizium"
-    if "/secure/" in ep_str or "/discover/" in ep_str:
+    if "/secure/" in combined or "/discover/" in combined:
         return "kraptor"
     if any(e.startswith("/api/") for e in all_eps):
         return "kraptor"
-    return "generic"
+    if any(
+        x in combined
+        for x in (
+            "/wp-json/",
+            "/graphql",
+            "/dizi/",
+            "/film/",
+            "/category/",
+            "?s=",
+            "?q=",
+            "?adi=",
+            "search?q",
+            "/arama",
+        )
+    ):
+        return "kraptor"
+    return "kraptor"
 
 
 # ---------------------------------------------------------------------------
 # Anizium-style API Template (bytecode'dan cikarilan tam bilgi)
 # ---------------------------------------------------------------------------
 
-def _anizium_api_template(cls, name, url, tvt, sr, lr, pt, hdr, mp, sep, epf, parsed):
+def _anizium_api_template(cls, name, url, tvt, sr, lr, pt, hdr, mp, search_ep, epf, parsed):
     ver = parsed.manifest.version
     pcn = parsed.manifest.plugin_class_name
 
@@ -209,7 +230,7 @@ class {cls}Provider(MainAPI):
         return HomePageResponse(items=[HomePageList(name=request.name, list=items)], has_next=has_next)
 
     async def search(self, query: str) -> List[{sr}]:
-        url = f"{{MAIN_URL}}{sep}{{query}}"
+        url = f"{{MAIN_URL}}{search_ep}{{query}}"
         try:
             with _client() as c:
                 r = c.get(url)
@@ -382,7 +403,7 @@ class {cls}Plugin(BasePlugin):
 # Kraptor-style API Template (/secure/ endpoint'ler)
 # ---------------------------------------------------------------------------
 
-def _kraptor_api_template(cls, name, url, tvt, sr, lr, pt, hdr, mp, sep, epf, parsed):
+def _kraptor_api_template(cls, name, url, tvt, sr, lr, pt, hdr, mp, search_ep, epf, parsed):
     ver = parsed.manifest.version
     pcn = parsed.manifest.plugin_class_name
     return f'''"""
@@ -428,8 +449,8 @@ class {cls}Provider(MainAPI):
         if ep in ("", "/"):
             url = f"{{MAIN_URL}}/secure/titles?type=series&page={{page}}&perPage=16"
         else:
-            sep = "&" if "?" in ep else "?"
-            url = f"{{MAIN_URL}}{{ep}}{{sep}}page={{page}}&perPage=16"
+            path_joiner = "&" if "?" in ep else "?"
+            url = f"{{MAIN_URL}}{{ep}}{{path_joiner}}page={{page}}&perPage=16"
         try:
             with _client() as c:
                 r = c.get(url)
@@ -475,7 +496,7 @@ class {cls}Provider(MainAPI):
         return HomePageResponse(items=[HomePageList(name=request.name, list=items)], has_next=has_next)
 
     async def search(self, query: str) -> List[{sr}]:
-        url = f"{{MAIN_URL}}{sep}{{query}}?limit=20"
+        url = f"{{MAIN_URL}}{search_ep}{{query}}?limit=20"
         try:
             with _client() as c:
                 r = c.get(url)
@@ -586,7 +607,7 @@ class {cls}Plugin(BasePlugin):
 # Scraper Template
 # ---------------------------------------------------------------------------
 
-def _scraper_template(cls, name, url, tvt, sr, lr, pt, hdr, mp, sep, epf,
+def _scraper_template(cls, name, url, tvt, sr, lr, pt, hdr, mp, search_ep, epf,
                       dex_cards, dex_titles, dex_posters,
                       dtitle, dplot, iframe, ep_list_sel, parsed):
     ver = parsed.manifest.version
@@ -798,8 +819,8 @@ class {cls}Provider(MainAPI):
         elif "?" in base:
             url = f"{{base}}&page={{page}}"
         else:
-            sep = "" if base.endswith("/") else "/"
-            url = f"{{base}}{{sep}}page/{{page}}/" if page > 1 else base
+            path_joiner = "" if base.endswith("/") else "/"
+            url = f"{{base}}{{path_joiner}}page/{{page}}/" if page > 1 else base
         try:
             with _client() as c:
                 r = c.get(url)
@@ -860,7 +881,7 @@ class {cls}Provider(MainAPI):
         return HomePageResponse(items=[HomePageList(name=section_name, list=items)], has_next=bool(items))
 
     async def search(self, query: str) -> List[{sr}]:
-        url = f"{{MAIN_URL}}{sep}{{query}}"
+        url = f"{{MAIN_URL}}{search_ep}{{query}}"
         try:
             with _client() as c:
                 r = c.get(url)

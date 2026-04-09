@@ -30,6 +30,7 @@ class CS3Manifest:
     name: str = ""
     version: int = 0
     requires_resources: bool = False
+    tv_types: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -300,11 +301,15 @@ def _legacy_parse_cs3_bytes(data: bytes, fallback_name: str = "Unknown") -> CS3P
     if "manifest.json" in zf.namelist():
         try:
             mdata = json.loads(zf.read("manifest.json").decode("utf-8"))
+            tv_raw = mdata.get("tvTypes", mdata.get("tv_types", []))
+            if not isinstance(tv_raw, list):
+                tv_raw = []
             manifest = CS3Manifest(
                 plugin_class_name=mdata.get("pluginClassName", ""),
                 name=mdata.get("name", fallback_name),
                 version=mdata.get("version", 0),
                 requires_resources=mdata.get("requiresResources", False),
+                tv_types=[str(x) for x in tv_raw],
             )
         except Exception as e:
             print(f"[CS3Parser] manifest.json parse hata: {e}")
@@ -357,7 +362,7 @@ def _legacy_parse_cs3_bytes(data: bytes, fallback_name: str = "Unknown") -> CS3P
     main_url = _detect_main_url(manifest.name, categorized.urls, all_strings)
 
     # --- TvType tespiti ---
-    tv_types = _detect_tv_types(all_strings)
+    tv_types = _detect_tv_types(all_strings, manifest.tv_types)
 
     return CS3ParseResult(
         manifest=manifest,
@@ -456,9 +461,22 @@ def _fetch_domain_from_list(name: str) -> str:
     return _DOMAIN_LIST_CACHE.get(name.lower(), "")
 
 
-def _detect_tv_types(all_strings: List[str]) -> List[str]:
+def _normalize_manifest_tv_types(raw: List[str]) -> Set[str]:
+    out: Set[str] = set()
+    for item in raw:
+        if not item:
+            continue
+        key = str(item).strip()
+        if key.startswith("TvType.") or key.startswith("TvType$"):
+            key = key.split(".", 1)[-1].split("$", 1)[-1]
+        if key in TV_TYPE_MAP:
+            out.add(TV_TYPE_MAP[key])
+    return out
+
+
+def _detect_tv_types(all_strings: List[str], manifest_tv_types: Optional[List[str]] = None) -> List[str]:
     """Desteklenen TvType'lari tespit et."""
-    types = set()
+    types = set(_normalize_manifest_tv_types(manifest_tv_types or []))
     for s in all_strings:
         if s.startswith("TvType.") or s.startswith("TvType$"):
             t = s.split(".", 1)[-1].split("$", 1)[-1]
@@ -466,7 +484,6 @@ def _detect_tv_types(all_strings: List[str]) -> List[str]:
                 types.add(TV_TYPE_MAP[t])
         elif s in TV_TYPE_MAP:
             types.add(TV_TYPE_MAP[s])
-    # Isme gore fallback
     if not types:
         types.add("TvSeries")
     return sorted(types)
